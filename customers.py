@@ -1,155 +1,241 @@
-"""Pazarlama › Müşteri Segmentasyonu (RFM + K-Means + müşteri kartı)"""
+"""Müşteri analitiği: RFM, K-Means segmentasyonu ve müşteri kaybı (churn) tahmini."""
 from __future__ import annotations
 
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+import re
 
-from src import charts, config as C, kpis, state, ui
-from src.customers import segment_summary
-from src.formatting import money, number, pct
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+from sklearn.metrics import silhouette_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-SEGMENT_ORDER = ["Şampiyon", "Sadık", "Potansiyel Sadık", "Yeni", "Umut Vaat Eden",
-                 "İlgi Bekleyen", "Uyumak Üzere", "Risk Altında", "Kaybedilmemeli", "Uykuda"]
-
-
-def rfm_tab(rfm, seg) -> None:
-    ui.kpi_row([
-        {"label": "Müşteri", "value": number(len(rfm))},
-        {"label": "Ort. Recency", "value": f"{rfm['Recency'].mean():.0f} gün",
-         "help": "Son alımdan bu yana geçen gün"},
-        {"label": "Ort. Frekans", "value": f"{number(rfm['Frequency'].mean(), 1)} sipariş"},
-        {"label": "Ort. Monetary", "value": money(rfm["Monetary"].mean())},
-    ])
-    left, right = st.columns([3, 2])
-    with left:
-        fig = px.treemap(seg, path=["Segment"], values="Müşteri", color="Ciro",
-                         color_continuous_scale=C.SEQUENTIAL,
-                         custom_data=["Ciro", "Ciro Payı %", "Müşteri Payı %"])
-        fig.update_traces(
-            texttemplate="<b>%{label}</b><br>%{value} müşteri<br>ciro %{customdata[1]:.0%}",
-            hovertemplate="<b>%{label}</b><br>Müşteri: %{value} (%{customdata[2]:.1%})"
-                          "<br>Ciro: ₺%{customdata[0]:,.0f}<extra></extra>",
-            marker_line_width=2, marker_line_color="white")
-        fig.update_traces(root_color="rgba(0,0,0,0)")
-        fig.update_layout(coloraxis_showscale=False)
-        ui.plot(charts.finish(fig, "RFM segmentleri (alan = müşteri sayısı, renk = ciro)", 430))
-    with right:
-        m = rfm.pivot_table(index="F", columns="R", values="CustomerID", aggfunc="count",
-                            fill_value=0).sort_index(ascending=False)
-        m.index = [f"F{i}" for i in m.index]
-        m.columns = [f"R{i}" for i in m.columns]
-        ui.plot(charts.heatmap(m, "R × F skor matrisi (müşteri sayısı)", fmt="d", height=430,
-                               text_fmt="d"))
-    ui.section("Segment profilleri ve önerilen aksiyonlar")
-    st.dataframe(seg, hide_index=True, column_config={
-        "Ciro": st.column_config.NumberColumn(format="₺%,.0f"),
-        "OrtCiro": st.column_config.NumberColumn("Ort. ciro", format="₺%,.0f"),
-        "OrtRecency": st.column_config.NumberColumn("Ort. recency (gün)", format="%.0f"),
-        "OrtFrekans": st.column_config.NumberColumn("Ort. frekans", format="%.1f"),
-        "Ciro Payı %": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1),
-        "Müşteri Payı %": st.column_config.NumberColumn(format="percent"),
-        "Önerilen aksiyon": st.column_config.TextColumn(width="large")})
-
-    sel = st.multiselect("Segment listesi", SEGMENT_ORDER, default=["Risk Altında", "Kaybedilmemeli"],
-                         key="c_seg", help="Kampanya listesi oluşturmak için segment seçin.")
-    lst = rfm[rfm["Segment"].isin(sel)].sort_values("Monetary", ascending=False)
-    cols = ["CustomerID", "Segment", "RFM", "Recency", "Frequency", "Monetary", "Şehir", "Son"]
-    st.dataframe(lst[cols], hide_index=True, height=280, column_config={
-        "Monetary": st.column_config.NumberColumn("Ciro", format="₺%,.0f"),
-        "Son": st.column_config.DateColumn("Son alım", format="DD.MM.YYYY")})
-    ui.download(lst[cols], "rfm_kampanya_listesi", "Kampanya listesini indir")
+# RFM skor çiftine (R, F) göre klasik segment haritası
+SEGMENT_MAP = {
+    r"[1-2][1-2]": "Uykuda",
+    r"[1-2][3-4]": "Risk Altında",
+    r"[1-2]5": "Kaybedilmemeli",
+    r"3[1-2]": "Uyumak Üzere",
+    r"33": "İlgi Bekleyen",
+    r"[3-4][4-5]": "Sadık",
+    r"41": "Umut Vaat Eden",
+    r"51": "Yeni",
+    r"[4-5][2-3]": "Potansiyel Sadık",
+    r"5[4-5]": "Şampiyon",
+}
+SEGMENT_ACTIONS = {
+    "Şampiyon": "Ödüllendir; yeni çıkan kitaplar için erken erişim ve özel kontenjan sun.",
+    "Sadık": "Çapraz satış: sık aldıkları kategorilere komşu kategorileri öner.",
+    "Potansiyel Sadık": "Sadakat programına dahil et, hacim bazlı kademeli iskonto öner.",
+    "Yeni": "Karşılama kampanyası; ikinci siparişi teşvik eden sepet iskontosu.",
+    "Umut Vaat Eden": "Katalog ve kampanya bildirimleriyle sipariş sıklığını artır.",
+    "İlgi Bekleyen": "Sınırlı süreli teklif ile yeniden etkileşim sağla.",
+    "Uyumak Üzere": "Satış temsilcisi araması; ihtiyaç ve stok durumunu sor.",
+    "Risk Altında": "Öncelikli geri kazanım: kişisel teklif ve temsilci ziyareti.",
+    "Kaybedilmemeli": "Yüksek değerli ama uzaklaşıyor — yönetici düzeyinde temas kur.",
+    "Uykuda": "Düşük maliyetli toplu kampanya; yanıt yoksa önceliği düşür.",
+}
 
 
-def kmeans_tab(c, rfm) -> None:
-    sil = state.silhouette(c["dedup"], c["filters"])
-    left, right = st.columns([1, 2])
-    with left:
-        fig = go.Figure(go.Scatter(x=sil["k"], y=sil["Siluet"], mode="lines+markers",
-                                   line=dict(color=C.SERIES[0], width=2), marker=dict(size=8)))
-        fig.update_xaxes(dtick=1, title="Küme sayısı (k)")
-        ui.plot(charts.finish(fig, "Siluet skoru", 260, y_title="Siluet"))
-        best = int(sil.loc[sil["Siluet"].idxmax(), "k"])
-        k = st.slider("Küme sayısı", 2, 8, 4, key="c_k",
-                      help=f"En yüksek siluet k={best}. İş açısından yorumlanabilirlik için "
-                           "4 küme varsayılan alınmıştır.")
-        st.caption(f"Öznitelikler: log(1+R), log(1+F), log(1+M), standartlaştırılmış. "
-                   f"En yüksek siluet k = **{best}**.")
-    out, prof = state.kmeans(c["dedup"], c["filters"], k)
-    with right:
-        tab_a, tab_b = st.tabs(["3B RFM uzayı", "PCA izdüşümü"])
-        colors = {name: C.SERIES[i] for i, name in enumerate(sorted(out["Küme"].unique()))}
-        with tab_a:
-            fig = px.scatter_3d(out, x="Recency", y="Frequency", z="Monetary", color="Küme",
-                                log_y=True, log_z=True, hover_name="CustomerID",
-                                color_discrete_map=colors, opacity=0.75)
-            fig.update_traces(marker=dict(size=3.5))
-            ui.plot(charts.finish(fig, None, 460))
-        with tab_b:
-            fig = px.scatter(out, x="PC1", y="PC2", color="Küme", hover_name="CustomerID",
-                             hover_data={"Recency": True, "Frequency": True,
-                                         "Monetary": ":,.0f", "PC1": False, "PC2": False},
-                             color_discrete_map=colors, opacity=0.8)
-            fig.update_traces(marker=dict(size=8, line=dict(color="white", width=1)))
-            ui.plot(charts.finish(fig, None, 460))
-    st.dataframe(prof, hide_index=True, column_config={
-        "OrtRecency": st.column_config.NumberColumn("Ort. recency (gün)", format="%.0f"),
-        "OrtFrekans": st.column_config.NumberColumn("Ort. frekans", format="%.1f"),
-        "OrtCiro": st.column_config.NumberColumn("Ort. ciro", format="₺%,.0f"),
-        "ToplamCiro": st.column_config.NumberColumn("Toplam ciro", format="₺%,.0f"),
-        "Ciro Payı %": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
-    cross = (out.groupby(["Küme", "Segment"]).size().unstack(fill_value=0))
-    with st.expander("K-Means kümeleri ile RFM segmentlerinin çapraz tablosu"):
-        st.dataframe(cross)
+def segment_of(rf_key: str) -> str:
+    """'R' ve 'F' skorlarından oluşan iki haneli anahtarı segment adına çevirir."""
+    for pattern, name in SEGMENT_MAP.items():
+        if re.fullmatch(pattern, rf_key):
+            return name
+    return "Diğer"
 
 
-def card_tab(c, df, rfm) -> None:
-    ids = rfm.sort_values("Monetary", ascending=False)["CustomerID"].tolist()
-    cid = st.selectbox("Müşteri (ciroya göre sıralı)", ids, key="c_card")
-    r = rfm[rfm["CustomerID"] == cid].iloc[0]
-    d = df[df["CustomerID"] == cid]
-    rank = ids.index(cid) + 1
-    ui.kpi_row([
-        {"label": "Segment", "value": r["Segment"], "help": f"RFM skoru {r['RFM']}"},
-        {"label": "Toplam ciro", "value": money(r["Monetary"]), "help": f"Ciro sıralaması: {rank}"},
-        {"label": "Sipariş", "value": number(r["Frequency"])},
-        {"label": "Son alım", "value": f"{r['Recency']} gün önce"},
-        {"label": "Şehir", "value": str(r["Şehir"])},
-    ])
-    a, b = st.columns(2)
-    with a:
-        m = kpis.monthly_trend(d)
-        fig = px.bar(m, x="Ay", y="Ciro", color_discrete_sequence=[C.SERIES[0]])
-        ui.plot(charts.bar_marks(charts.finish(fig, "Aylık alımlar", 320, money_axis=True,
-                                               x_title="")))
-    with b:
-        cat = kpis.by_dimension(d, "Category", 8)
-        cat["Etiket"] = cat["Pay %"].map(pct)
-        ui.plot(charts.hbar(cat, "Ciro", "Category", "Tercih ettiği kategoriler", text="Etiket",
-                            height=320, color=C.SERIES[2]))
-    top = kpis.top_products(d, 15)
-    st.dataframe(top, hide_index=True, column_config={
-        "Ciro": st.column_config.NumberColumn(format="₺%,.0f")})
+def _score(s: pd.Series, ascending: bool = True) -> pd.Series:
+    """1-5 arası beşli skor (bağları kırmak için sıralama kullanılır)."""
+    ranks = s.rank(method="first", ascending=ascending)
+    return pd.qcut(ranks, 5, labels=[1, 2, 3, 4, 5]).astype(int)
 
 
-def render() -> None:
-    c = state.ctx()
-    df = state.filtered(c["dedup"], c["filters"])
-    ui.page_header("Müşteri Segmentasyonu",
-                   "RFM skorlaması ve K-Means kümeleme ile müşteri değer grupları.",
-                   c["filters"].describe())
-    if not ui.guard(df, 100):
-        return
-    rfm = state.rfm(c["dedup"], c["filters"])
-    if len(rfm) < 20:
-        st.warning("Segmentasyon için en az 20 müşteri gerekir; filtreleri genişletin.")
-        return
-    seg = segment_summary(rfm)
-    t1, t2, t3 = st.tabs([":material/grid_view: RFM Analizi", ":material/hub: K-Means Kümeleme",
-                          ":material/badge: Müşteri Kartı"])
-    with t1:
-        rfm_tab(rfm, seg)
-    with t2:
-        kmeans_tab(c, rfm)
-    with t3:
-        card_tab(c, df, rfm)
+def rfm_table(df: pd.DataFrame, ref_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    ref = (ref_date or df["InvoiceDate"].max()) + pd.Timedelta(days=1)
+    g = (df.groupby("CustomerID", observed=True)
+           .agg(Son=("InvoiceDate", "max"), İlk=("InvoiceDate", "min"),
+                Frequency=("InvoiceNo", "nunique"), Monetary=("Revenue", "sum"),
+                Şehir=("City", "first"), Kategori=("Category", "nunique")))
+    g["Recency"] = (ref - g["Son"]).dt.days
+    g = g[g["Monetary"] > 0]
+    if len(g) < 5:
+        return g.assign(R=np.nan, F=np.nan, M=np.nan, Segment="—")
+    g["R"] = _score(g["Recency"], ascending=False)
+    g["F"] = _score(g["Frequency"])
+    g["M"] = _score(g["Monetary"])
+    g["RFM"] = g["R"].astype(str) + g["F"].astype(str) + g["M"].astype(str)
+    key = g["R"].astype(str) + g["F"].astype(str)
+    g["Segment"] = key.map(segment_of)
+    return g.reset_index()
+
+
+def segment_summary(rfm: pd.DataFrame) -> pd.DataFrame:
+    s = (rfm.groupby("Segment")
+            .agg(Müşteri=("CustomerID", "count"), Ciro=("Monetary", "sum"),
+                 OrtRecency=("Recency", "mean"), OrtFrekans=("Frequency", "mean"),
+                 OrtCiro=("Monetary", "mean"))
+            .sort_values("Ciro", ascending=False))
+    s["Ciro Payı %"] = s["Ciro"] / s["Ciro"].sum()
+    s["Müşteri Payı %"] = s["Müşteri"] / s["Müşteri"].sum()
+    s["Önerilen aksiyon"] = s.index.map(SEGMENT_ACTIONS).fillna("")
+    return s.reset_index()
+
+
+# ---------------------------------------------------------------------------
+# K-Means
+# ---------------------------------------------------------------------------
+def _rfm_matrix(rfm: pd.DataFrame) -> np.ndarray:
+    X = np.log1p(rfm[["Recency", "Frequency", "Monetary"]].to_numpy(dtype=float))
+    return StandardScaler().fit_transform(X)
+
+
+def silhouette_by_k(rfm: pd.DataFrame, ks=range(2, 9)) -> pd.DataFrame:
+    X = _rfm_matrix(rfm)
+    rows = []
+    for k in ks:
+        if k >= len(X):
+            break
+        km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+        rows.append({"k": k, "Siluet": silhouette_score(X, km.labels_),
+                     "Inertia": km.inertia_})
+    return pd.DataFrame(rows)
+
+
+def kmeans_segments(rfm: pd.DataFrame, k: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """K-Means kümeleri + 2 boyutlu PCA izdüşümü ve küme profilleri."""
+    X = _rfm_matrix(rfm)
+    km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+    pcs = PCA(n_components=2, random_state=42).fit_transform(X)
+    out = rfm.copy()
+    out["PC1"], out["PC2"] = pcs[:, 0], pcs[:, 1]
+
+    # Kümeleri ortalama ciroya göre sırala ve anlamlı isim ver
+    prof = (out.assign(_c=km.labels_)
+               .groupby("_c")[["Recency", "Frequency", "Monetary"]].mean()
+               .sort_values("Monetary", ascending=False))
+    names = ["Değerli", "Gelişen", "Ara", "Düşük Değer", "Pasif", "K6", "K7", "K8"]
+    rename = {c: f"K{i + 1} · {names[i]}" for i, c in enumerate(prof.index)}
+    out["Küme"] = pd.Series(km.labels_, index=out.index).map(rename)
+    profile = (out.groupby("Küme")
+                  .agg(Müşteri=("CustomerID", "count"), OrtRecency=("Recency", "mean"),
+                       OrtFrekans=("Frequency", "mean"), OrtCiro=("Monetary", "mean"),
+                       ToplamCiro=("Monetary", "sum"))
+                  .sort_values("OrtCiro", ascending=False))
+    profile["Ciro Payı %"] = profile["ToplamCiro"] / profile["ToplamCiro"].sum()
+    return out, profile.reset_index()
+
+
+# ---------------------------------------------------------------------------
+# Müşteri kaybı (churn) tahmini
+# ---------------------------------------------------------------------------
+FEATURE_LABELS = {
+    "recency": "Son alımdan bu yana gün",
+    "frequency": "Sipariş sayısı",
+    "monetary": "Toplam ciro",
+    "tenure": "Müşteri yaşı (gün)",
+    "aov": "Ortalama sipariş tutarı",
+    "n_categories": "Farklı kategori sayısı",
+    "avg_discount": "Ortalama iskonto",
+    "mean_gap": "Ortalama sipariş aralığı",
+    "recent_share": "Son 60 günün ciro payı",
+    "active_months": "Aktif ay sayısı",
+}
+
+
+def customer_features(df: pd.DataFrame, ref: pd.Timestamp) -> pd.DataFrame:
+    """Referans tarihine kadar olan işlemlerden müşteri düzeyinde öznitelikler."""
+    d = df[df["InvoiceDate"] <= ref]
+    inv = (d.groupby(["CustomerID", "InvoiceNo"], observed=True)
+             .agg(date=("InvoiceDate", "first"), rev=("Revenue", "sum")).reset_index())
+    inv = inv.sort_values(["CustomerID", "date"])
+    inv["gap"] = inv.groupby("CustomerID", observed=True)["date"].diff().dt.days
+    recent_cut = ref - pd.Timedelta(days=60)
+
+    f = inv.groupby("CustomerID", observed=True).agg(
+        last=("date", "max"), first=("date", "min"), frequency=("InvoiceNo", "nunique"),
+        monetary=("rev", "sum"), mean_gap=("gap", "mean"))
+    f["recency"] = (ref - f["last"]).dt.days
+    f["tenure"] = (ref - f["first"]).dt.days
+    f["aov"] = f["monetary"] / f["frequency"]
+    recent = inv[inv["date"] > recent_cut].groupby("CustomerID", observed=True)["rev"].sum()
+    f["recent_share"] = (recent.reindex(f.index).fillna(0) / f["monetary"]).clip(0, 1)
+    line = d.groupby("CustomerID", observed=True).agg(
+        n_categories=("Category", "nunique"), avg_discount=("DiscountRate", "mean"),
+        active_months=("Month", "nunique"))
+    f = f.join(line)
+    f["mean_gap"] = f["mean_gap"].fillna(f["tenure"].clip(lower=1))
+    return f.drop(columns=["last", "first"])
+
+
+def churn_model(df: pd.DataFrame, horizon: int = 60, inactivity: int | None = None) -> dict:
+    """Zaman bazlı churn modeli.
+
+    Gözlem penceresi: kesim tarihinden önceki tüm işlemler.
+    Etiket: müşteri kesim tarihinden sonraki `horizon` gün içinde hiç alım yapmadıysa 1.
+    Eğitilen model, tüm veriyle hesaplanan güncel özniteliklere uygulanarak
+    önümüzdeki `horizon` gün için kayıp olasılığı üretilir.
+    """
+    end = df["InvoiceDate"].max()
+    cutoff = end - pd.Timedelta(days=horizon)
+    if (cutoff - df["InvoiceDate"].min()).days < 90:
+        return {"error": "Churn modeli için en az ~5 aylık veri gerekir; tarih aralığını genişletin."}
+
+    X = customer_features(df, cutoff)
+    after = df[df["InvoiceDate"] > cutoff]["CustomerID"].unique()
+    y = (~X.index.isin(after)).astype(int)
+    if y.sum() < 10 or (1 - y).sum() < 10:
+        return {"error": "Seçili filtrelerde iki sınıf için yeterli müşteri yok."}
+
+    feats = list(FEATURE_LABELS)
+    models = {
+        "Lojistik Regresyon": make_pipeline(
+            StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced")),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300, min_samples_leaf=5, class_weight="balanced",
+            random_state=42, n_jobs=-1),
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    Xtr, Xte, ytr, yte = train_test_split(X[feats], y, test_size=0.25,
+                                          stratify=y, random_state=42)
+    scores = []
+    for name, m in models.items():
+        cv_auc = cross_val_score(m, X[feats], y, cv=cv, scoring="roc_auc")
+        m.fit(Xtr, ytr)
+        p = m.predict_proba(Xte)[:, 1]
+        pr, rc, f1, _ = precision_recall_fscore_support(
+            yte, (p >= 0.5).astype(int), average="binary", zero_division=0)
+        scores.append({"Model": name, "CV ROC-AUC": cv_auc.mean(), "± std": cv_auc.std(),
+                       "Test ROC-AUC": roc_auc_score(yte, p),
+                       "Kesinlik": pr, "Duyarlılık": rc, "F1": f1})
+    scores = pd.DataFrame(scores).sort_values("Test ROC-AUC", ascending=False)
+    best_name = scores.iloc[0]["Model"]
+    best = models[best_name].fit(X[feats], y)  # tüm eğitim kümesiyle yeniden eğit
+
+    if best_name == "Random Forest":
+        imp = best.feature_importances_
+    else:
+        imp = np.abs(best[-1].coef_[0])
+    importance = (pd.DataFrame({"Öznitelik": [FEATURE_LABELS[f] for f in feats],
+                                "Önem": imp / imp.sum()})
+                    .sort_values("Önem"))
+
+    current = customer_features(df, end)
+    current["Kayıp Olasılığı"] = best.predict_proba(current[feats])[:, 1]
+    current = current.reset_index()
+    return {"scores": scores, "best": best_name, "importance": importance,
+            "scored": current, "cutoff": cutoff, "churn_rate": y.mean(),
+            "n_train": len(y)}
+
+
+def risk_band(p: float) -> str:
+    if p >= 0.7:
+        return "Yüksek"
+    if p >= 0.4:
+        return "Orta"
+    return "Düşük"
