@@ -6,7 +6,7 @@ Bir B2B kitap dağıtımcısının 2020 yılına ait ~664 bin satırlık satış
 **tedarik zinciri** departmanları için KPI'lar, etkileşimli grafikler, makine öğrenmesi tabanlı tahminler ve
 otomatik içgörüler üreten bir karar destek sistemi.
 
-🔗 **Canlı panel:** _(Streamlit Cloud bağlantısı)_
+🔗 **Canlı panel:** _([Streamlit Cloud bağlantısı](https://b2b-book-analytics-dashboard.streamlit.app/))_
 
 ---
 
